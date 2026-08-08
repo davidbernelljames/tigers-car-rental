@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "vehicles" ADD COLUMN     "seats" INTEGER NOT NULL DEFAULT 5,
+ALTER COLUMN "color" DROP DEFAULT;

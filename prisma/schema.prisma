@@ -1,0 +1,399 @@
+// ============================================================================
+// Tiger's Car Rental — Prisma Schema
+// INFO 0412 Senior Seminar II — Digital Transformation of Tiger's Car Rental
+// Student: David James (20170303)
+//
+// TRACEABILITY NOTE:
+// Models marked [SS1 6.6] are taken directly, field-for-field, from the
+// approved Senior Seminar I Data Dictionary (Section 6.6).
+// Models marked [Extension] complete the SS1 ER Model's ten-core-entity scope
+// (Section 6.3) using fields already referenced in the approved Pseudocode
+// document (Algorithms A-01, A-02, A-03) and the Solution Implementation
+// Plan (Sections 2.3 User Interface, 2.5 Automated Triggers).
+// Every field carries an FR/gap ID comment where one applies, consistent
+// with the DAR Models traceability convention used throughout this project.
+// ============================================================================
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+
+// ----------------------------------------------------------------------------
+// [SS1 6.6] Customer — booking party, distinct from staff/admin Users below
+// ----------------------------------------------------------------------------
+model Customer {
+  customerId Int      @id @default(autoincrement()) @map("customer_id")
+  firstName  String   @map("first_name") @db.VarChar(50)
+  lastName   String   @map("last_name") @db.VarChar(50)
+  email      String   @unique @db.VarChar(100)
+  phone      String   @db.VarChar(20)
+  // [Extension, form-derived] Matches the paper form's ADDRESS field.
+  address    String   @default("") @db.VarChar(255)
+  // [Form-derived] Single free-text field, matching the paper form —
+  // deliberately not an ID-type dropdown (National ID/Passport/Permit).
+  // What matters for a rental is proof of entitlement to DRIVE, not
+  // identity, and free text also covers overseas visitors' international
+  // permits the same way the paper form always has.
+  drivingPermitNumber String @default("") @map("driving_permit_number") @db.VarChar(50)
+  // Supabase Auth UID — links this record to an authenticated S7 My Account session (FR-14)
+  authUserId String?  @unique @map("auth_user_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  bookings Booking[]
+  reviews  Review[]
+
+  @@map("customers")
+}
+
+
+// ----------------------------------------------------------------------------
+// [SS1 6.6] Vehicle — fleet catalogue, central to S1/S2 and A4 Fleet Management
+// ----------------------------------------------------------------------------
+model Vehicle {
+  vehicleId Int           @id @default(autoincrement()) @map("vehicle_id")
+  make      String        @db.VarChar(50)
+  model     String        @db.VarChar(50)
+  color     String        @db.VarChar(30)
+  // [Extension, form-derived] Matches "VEHICLE #" on the paper form.
+  // Nullable in case a new vehicle's plate isn't confirmed yet.
+  registrationNumber String? @map("registration_number") @db.VarChar(20)
+  seats     Int           @default(5)
+  dailyRate Decimal       @map("daily_rate") @db.Decimal(8, 2)
+  category  VehicleCategory
+  status    VehicleStatus @default(AVAILABLE)
+  // Supabase Storage bucket path (FR-09 Vehicle Catalogue); nullable pending real fleet photography
+  photoUrl  String?       @map("photo_url") @db.VarChar(255)
+
+  bookings           Booking[]
+  maintenanceRecords MaintenanceRecord[]
+  promotions         Promotion[]
+
+  @@map("vehicles")
+}
+
+// Two tiers only — categories with zero matching vehicles (SUV, PICKUP,
+// and later WAGON once that vehicle sold) were removed as clutter, not
+// realistic choices. Add one back if the fleet needs it again.
+enum VehicleCategory {
+  ECONOMY
+  SEDAN
+
+  @@map("vehicle_category")
+}
+
+enum VehicleStatus {
+  AVAILABLE
+  ON_RENTAL
+  IN_MAINTENANCE
+  // For a sold vehicle. Not deleted (booking history must keep a valid
+  // vehicle to point to) — the customer catalogue query excludes RETIRED
+  // instead, so a sold car can't still be booked.
+  RETIRED
+
+  @@map("vehicle_status")
+}
+
+// ----------------------------------------------------------------------------
+// [SS1 6.6] Booking — central entity of the ER Model (SS1 6.3);
+// many-to-one to Vehicle, one-to-many historically from Vehicle
+// ----------------------------------------------------------------------------
+model Booking {
+  bookingId     Int           @id @default(autoincrement()) @map("booking_id")
+  bookingRef    String        @unique @map("booking_ref") @db.VarChar(20)
+  customerId    Int           @map("customer_id")
+  vehicleId     Int           @map("vehicle_id")
+  pickupDate    DateTime      @map("pickup_date") @db.Date
+  returnDate    DateTime      @map("return_date") @db.Date
+  totalCost     Decimal       @map("total_cost") @db.Decimal(10, 2)
+  // Equals totalCost once authorised — full prepayment, not a deposit.
+  amountPaid    Decimal       @default(0) @map("amount_paid") @db.Decimal(10, 2)
+  // WiPay has no programmatic refund — these track it as a manual
+  // obligation instead. refundDue set + refundedAt null = still outstanding.
+  refundDue     Decimal?      @map("refund_due") @db.Decimal(10, 2)
+  refundedAt    DateTime?     @map("refunded_at")
+  cancelledAt   DateTime?     @map("cancelled_at")
+
+  // [Corrected] Algorithm A-05 was redesigned after real testing surfaced a
+  // genuine flaw: the previous version let an ADMIN generate and follow the
+  // WiPay payment link themselves, meaning staff — not the customer — ended
+  // up on WiPay's own checkout entering payment details. That's backwards
+  // from how every other payment in this system works (the payer's own
+  // browser reaches WiPay, never staff's). The corrected flow separates
+  // three distinct actions that were wrongly collapsed into one: the
+  // CUSTOMER requests an extension, STAFF only grants or declines based on
+  // availability, and the CUSTOMER alone completes payment.
+  extensionStatus            ExtensionStatus @default(NONE) @map("extension_status")
+  extensionRequestedReturnDate DateTime?     @map("extension_requested_return_date")
+  extensionCost              Decimal?        @map("extension_cost") @db.Decimal(10, 2)
+  extensionDeclineReason     String?         @map("extension_decline_reason") @db.VarChar(255)
+
+  // Trigger dispatch stamps (T-02, T-04), null = not yet sent. Makes the
+  // reminder cron idempotent — re-running it can't double-send.
+  reminder48SentAt      DateTime? @map("reminder_48_sent_at")
+  reminder24SentAt      DateTime? @map("reminder_24_sent_at")
+  feedbackRequestSentAt DateTime? @map("feedback_request_sent_at")
+  bookingStatus BookingStatus @default(PENDING) @map("booking_status")
+  createdAt     DateTime      @default(now()) @map("created_at")
+
+  // [Extension, form-derived] Matches the paper form's MILEAGE/fuel fields.
+  // Nullable — genuinely unknown until physical pickup, left blank on the
+  // PDF generated at payment time, and filled in by staff at handover.
+  mileageAtPickup   Int?       @map("mileage_at_pickup")
+  fuelLevelAtPickup FuelLevel? @map("fuel_level_at_pickup")
+  mileageAtReturn   Int?       @map("mileage_at_return")
+  fuelLevelAtReturn FuelLevel? @map("fuel_level_at_return")
+
+  customer           Customer            @relation(fields: [customerId], references: [customerId])
+  vehicle             Vehicle             @relation(fields: [vehicleId], references: [vehicleId])
+  paymentTransactions PaymentTransaction[]
+  rentalAgreement     RentalAgreement?
+  review              Review?
+
+  @@index([vehicleId, pickupDate, returnDate]) // Algorithm A-01 overlap-conflict query
+  @@index([bookingStatus, pickupDate])          // Algorithm A-03 reminder cron query
+  @@map("bookings")
+}
+
+// [Extension, form-derived] Fuel level at pickup — must be matched on
+// return (Kadesh's policy), recorded per-booking since it varies every time.
+enum FuelLevel {
+  FULL
+  THREE_QUARTER
+  HALF
+  QUARTER
+  EMPTY
+
+  @@map("fuel_level")
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  ON_RENTAL
+  COMPLETED
+  CANCELLED
+
+  @@map("booking_status")
+}
+
+// Algorithm A-05: tracks an extension request through customer request ->
+// staff review -> customer payment. NONE is the default/resting state for
+// almost every booking; the other three only apply while a request is
+// actually in flight.
+enum ExtensionStatus {
+  NONE
+  PENDING_REVIEW
+  APPROVED_AWAITING_PAYMENT
+  DECLINED
+
+  @@map("extension_status")
+}
+
+// ----------------------------------------------------------------------------
+// [SS1 6.6] PaymentTransaction — one row per WiPay callback outcome (A-02)
+// ----------------------------------------------------------------------------
+model PaymentTransaction {
+  transactionId Int               @id @default(autoincrement()) @map("transaction_id")
+  bookingId     Int               @map("booking_id")
+  amount        Decimal           @db.Decimal(10, 2)
+  gatewayRef    String            @map("gateway_ref") @db.VarChar(100)
+  status        TransactionStatus
+  transactionAt DateTime          @default(now()) @map("transaction_at")
+
+  // Cascade: a payment record is meaningless once its booking is gone, and
+  // its absence previously blocked deleting bookings in the Supabase Table
+  // Editor with a foreign-key-constraint error.
+  booking Booking @relation(fields: [bookingId], references: [bookingId], onDelete: Cascade)
+
+  @@map("payment_transactions")
+}
+
+// Mirrors the six SS1 Decision Table outcomes (Section 6.5) handled in Algorithm A-02
+enum TransactionStatus {
+  AUTHORISED
+  DECLINED
+  TIMEOUT
+  RETRY_AUTHORISED
+  RETRY_DECLINED
+
+  @@map("transaction_status")
+}
+
+// ----------------------------------------------------------------------------
+// [Extension] Promotion — referenced in Pseudocode A-01 Step 6/7 and A7 screen;
+// resolves G17 (seasonal marketing discount automation)
+// ----------------------------------------------------------------------------
+model Promotion {
+  promotionId     Int             @id @default(autoincrement()) @map("promotion_id")
+  code            String          @unique @db.VarChar(20)
+  vehicleCategory VehicleCategory @map("vehicle_category")
+  discountPercent Decimal         @map("discount_percent") @db.Decimal(5, 2)
+  startDate       DateTime        @map("start_date") @db.Date
+  expiryDate      DateTime        @map("expiry_date") @db.Date
+
+  // Optional link if a promo is scoped to one vehicle rather than a whole category
+  vehicleId Int?     @map("vehicle_id")
+  vehicle   Vehicle? @relation(fields: [vehicleId], references: [vehicleId])
+
+  @@index([vehicleCategory, startDate, expiryDate]) // Algorithm A-01 Step 6 query
+  @@map("promotions")
+}
+
+// ----------------------------------------------------------------------------
+// [Extension] MaintenanceRecord — referenced in Pseudocode A-01 Step 4 and A8 screen;
+// resolves scheduling gap between owner and external service providers
+// ----------------------------------------------------------------------------
+// A lightweight provider directory — not a staff account or login. Real
+// providers work by phone/WhatsApp and never sign in; this only fixes a
+// data-quality problem (the same real provider being recorded under several
+// different free-text spellings over time), with an "add new" option kept
+// open for the occasional one-off provider outside the regular few.
+model MaintenanceProvider {
+  providerId  Int                     @id @default(autoincrement()) @map("provider_id")
+  name        String                  @db.VarChar(100)
+  serviceType MaintenanceProviderType @map("service_type")
+  phone       String?                 @db.VarChar(20) // Kadesh's own reference only
+  createdAt   DateTime                @default(now()) @map("created_at")
+
+  maintenanceRecords MaintenanceRecord[]
+
+  @@map("maintenance_providers")
+}
+
+model MaintenanceRecord {
+  maintenanceId Int               @id @default(autoincrement()) @map("maintenance_id")
+  vehicleId     Int               @map("vehicle_id")
+  serviceType   String            @map("service_type") @db.VarChar(100)
+  serviceDate   DateTime          @map("service_date") @db.Date
+  status        MaintenanceStatus @default(SCHEDULED)
+  providerId    Int               @map("provider_id") // references the directory above
+
+  vehicle  Vehicle             @relation(fields: [vehicleId], references: [vehicleId])
+  provider MaintenanceProvider @relation(fields: [providerId], references: [providerId])
+
+  @@index([vehicleId, serviceDate]) // Algorithm A-01 Step 4 maintenance-block query
+  @@map("maintenance_records")
+}
+
+enum MaintenanceStatus {
+  SCHEDULED
+  COMPLETED
+
+  @@map("maintenance_status")
+}
+
+// The four external provider types from the SS1 Stakeholder Register.
+// Labels directory entries only — no accounts or logins attached.
+enum MaintenanceProviderType {
+  MECHANIC
+  AUTO_DETAILER
+  BODY_TECHNICIAN
+  WINDOW_TINTING
+  OTHER
+
+  @@map("maintenance_provider_type")
+}
+
+// ----------------------------------------------------------------------------
+// [Extension] RentalAgreement — referenced in Pseudocode A-02 Step 7/8;
+// generated by @react-pdf/renderer, stored in Supabase Storage
+// ----------------------------------------------------------------------------
+model RentalAgreement {
+  agreementId Int             @id @default(autoincrement()) @map("agreement_id")
+  bookingId   Int             @unique @map("booking_id")
+  filePath    String          @map("file_path") @db.VarChar(255)
+  generatedAt DateTime        @default(now()) @map("generated_at")
+  status      AgreementStatus @default(GENERATED)
+
+  // Cascade: deleting a test booking takes its agreement record with it.
+  booking Booking @relation(fields: [bookingId], references: [bookingId], onDelete: Cascade)
+
+  @@map("rental_agreements")
+}
+
+enum AgreementStatus {
+  GENERATED
+  PENDING_RETRY
+
+  @@map("agreement_status")
+}
+
+// ----------------------------------------------------------------------------
+// [Extension] Review — referenced in the 1st Prototype S1 "Customer Reviews" block
+// and S7 "Leave Review" action for Completed bookings
+// ----------------------------------------------------------------------------
+model Review {
+  reviewId  Int      @id @default(autoincrement()) @map("review_id")
+  bookingId Int      @unique @map("booking_id")
+  customerId Int     @map("customer_id")
+  rating    Int      @db.SmallInt // 1–5, enforced in application layer
+  comment   String?  @db.VarChar(500)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Cascade for the same reason as PaymentTransaction/RentalAgreement above.
+  booking  Booking  @relation(fields: [bookingId], references: [bookingId], onDelete: Cascade)
+  customer Customer @relation(fields: [customerId], references: [customerId])
+
+  @@map("reviews")
+}
+
+// ----------------------------------------------------------------------------
+// [Extension] User — staff/admin authentication and role differentiation
+// (SIP Section 2.3). STAFF_AGENT corresponds to the "Admin Assistant"
+// stakeholder in the SS1 Register. Enforced at two layers: Next.js
+// middleware (route layer) and Supabase RLS (database layer).
+// ----------------------------------------------------------------------------
+model User {
+  userId     Int      @id @default(autoincrement()) @map("user_id")
+  authUserId String   @unique @map("auth_user_id") @db.Uuid // Supabase Auth UID
+  firstName  String   @map("first_name") @db.VarChar(50)
+  lastName   String   @map("last_name") @db.VarChar(50)
+  email      String   @unique @db.VarChar(100)
+  role       UserRole
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@map("users")
+}
+
+enum UserRole {
+  OWNER_ADMIN // Full access — all A1–A9 modules (SIP 2.3)
+  STAFF_AGENT // "Admin Assistant" per SS1 Register — limited: today's pickups/returns, no financials or settings
+
+  @@map("user_role")
+}
+
+// ----------------------------------------------------------------------------
+// [Extension] SystemSettings — referenced in A9 System Settings screen and
+// Pseudocode A-02 Step 8 (DEPOSIT_RATE) / A-03 Step 2 (notification toggles).
+// Single-row configuration table.
+// ----------------------------------------------------------------------------
+model SystemSettings {
+  settingsId                Int      @id @default(autoincrement()) @map("settings_id")
+  businessName              String   @map("business_name") @db.VarChar(100)
+  businessPhone             String   @map("business_phone") @db.VarChar(20)
+  businessPhoneSecondary    String?  @map("business_phone_secondary") @db.VarChar(20) // Kadesh runs two lines
+  businessEmail             String   @map("business_email") @db.VarChar(100)
+  businessAddress           String   @map("business_address") @db.VarChar(255)
+  // Cancellation policy (SS1 6.5): full refund if cancelled more than
+  // fullRefundWindowHours before pickup, else cancellationFeePercent is
+  // retained. No security deposit field — Kadesh's actual practice is
+  // discretionary and assessed in person, not a fixed rule to encode.
+  fullRefundWindowHours     Int      @default(48) @map("full_refund_window_hours")
+  cancellationFeePercent    Decimal  @default(25) @map("cancellation_fee_percent") @db.Decimal(5, 2)
+  // Flat fee, not tied to which vehicle was rented — Kadesh's actual policy.
+  lateReturnGraceHours Int     @default(1) @map("late_return_grace_hours")
+  lateFeeAmount        Decimal @default(100) @map("late_fee_amount") @db.Decimal(8, 2)
+  reminderNotificationsEnabled Boolean @default(true) @map("reminder_notifications_enabled") // T-02
+  feedbackNotificationsEnabled Boolean @default(true) @map("feedback_notifications_enabled") // T-04
+  updatedAt                 DateTime @updatedAt @map("updated_at")
+
+  @@map("system_settings")
+}
